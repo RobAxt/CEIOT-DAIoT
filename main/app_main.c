@@ -4,11 +4,14 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <time.h>
+#include <sys/time.h>
 #include "esp_wifi.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_sntp.h"
 #include "protocol_examples_common.h"
 
 #include "driver/gpio.h"
@@ -47,7 +50,7 @@ static const char *STATE_TOPIC     = "tele/ambientNode/STATE";
 static const char *STATE_RESPONSE  = "{\"Time\": \"%s\",\"POWER1\": \"%s\",\"POWER2\": \"%s\",\"POWER3\": \"%s\",\"POWER4\": \"%s\"}";
 char state_response[100];
 static const char *SENSOR_TOPIC    = "tele/ambientNode/SENSOR";
-static const char *SENSOR_RESPONSE = "{\"Time\":\"%s\",\"DS18B20-1\": {\"Id\":\"%s\",\"Temperature\": %0.1f},\"DS18B20-2\": {\"Id\": \"%s\",\"Temperature\": %0.1f},\"TempUnit\": \"C\"}"; 
+static const char *SENSOR_RESPONSE = "{\"Time\": \"%s\",\"DS18B20-1\": {\"Id\": \"%s\",\"Temperature\": %0.1f},\"DS18B20-2\": {\"Id\": \"%s\",\"Temperature\": %0.1f},\"TempUnit\": \"C\"}"; 
 char sensor_response[200];
 
 // Subscription Topics
@@ -66,6 +69,10 @@ DeviceAddress tempSensors[2];
 char sId0[18];
 char sId1[18];
 
+time_t now = 0;
+struct tm timeinfo = { 0 };
+char strftime_buf[20];
+
 extern const uint8_t client_cert_pem_start[] asm("_binary_client_crt_start");
 extern const uint8_t client_cert_pem_end[] asm("_binary_client_crt_end");
 extern const uint8_t client_key_pem_start[] asm("_binary_client_key_start");
@@ -74,6 +81,8 @@ extern const uint8_t server_cert_pem_start[] asm("_binary_broker_CA_crt_start");
 extern const uint8_t server_cert_pem_end[] asm("_binary_broker_CA_crt_end");
 
 static void mqtt_event_data_handler(esp_mqtt_client_handle_t client, esp_mqtt_event_handle_t event);
+static void obtain_time(void);
+static void initialize_sntp(void);
 
 static void log_error_if_nonzero(const char *message, int error_code)
 {
@@ -196,7 +205,10 @@ static void mqtt_event_data_handler(esp_mqtt_client_handle_t client, esp_mqtt_ev
             power4Shadow = false;
         }
     }
-    sprintf(state_response,STATE_RESPONSE,"2022-11-05T19:03:53",power1Shadow?"ON":"OFF",power2Shadow?"ON":"OFF",power3Shadow?"ON":"OFF",power4Shadow?"ON":"OFF");
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%dT%H:%M:%S", &timeinfo);
+    sprintf(state_response,STATE_RESPONSE, (char *)strftime_buf, power1Shadow?"ON":"OFF", power2Shadow?"ON":"OFF", power3Shadow?"ON":"OFF", power4Shadow?"ON":"OFF");
     printf(state_response);printf("\r\n");
     int msg_id = esp_mqtt_client_publish(client, STATE_TOPIC, state_response, 0, 0, 0);
     ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
@@ -213,8 +225,10 @@ static void mqtt_publisher_handler(void* arg){
                tempId0 = ds18b20_getTempC((DeviceAddress *)tempSensors[0]);
                tempId1 = ds18b20_getTempC((DeviceAddress *)tempSensors[1]);
             } while (tempId0 <=0 || tempId1 <=0);
-
-            sprintf(sensor_response,SENSOR_RESPONSE,"2022-11-05T19:03:53",sId0,tempId0,sId1,tempId1);
+            time(&now);
+            localtime_r(&now, &timeinfo);
+            strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%dT%H:%M:%S", &timeinfo);
+            sprintf(sensor_response, SENSOR_RESPONSE, (char*) strftime_buf, sId0, tempId0, sId1, tempId1);
             printf(sensor_response);printf("\r\n");
             int msg_id = esp_mqtt_client_publish(client, SENSOR_TOPIC, sensor_response, 0, 0, 0);
             ESP_LOGI(TAG, "sent publish successful, msg_id=%d", msg_id);
@@ -299,4 +313,58 @@ void app_main(void)
     mqtt_app_start();
 
     xTaskCreate(mqtt_publisher_handler, "mqtt_publisher_handler", 2048, NULL, 10, NULL);
+
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    if (timeinfo.tm_year < (2016 - 1900)) {
+        ESP_LOGI(TAG, "Time is not set yet. Connect getting time over NTP.");
+        obtain_time();
+        time(&now);
+     }
+}
+
+
+static void obtain_time(void)
+{
+    initialize_sntp();
+
+    int retry = 0;
+    const int retry_count = 15;
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < retry_count) {
+        ESP_LOGI(TAG, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+    }
+    time(&now);
+    localtime_r(&now, &timeinfo);
+   // setenv("TZ", "UTC-3", 1);
+   // tzset();
+   // localtime_r(&now, &timeinfo); "2022-11-05T19:03:53"
+    strftime(strftime_buf, sizeof(strftime_buf), "%Y-%m-%dT%H:%M:%S", &timeinfo);
+    ESP_LOGI(TAG, "The current date/time is: %s", strftime_buf);
+}
+
+static void initialize_sntp(void)
+{
+    ESP_LOGI(TAG, "Initializing SNTP");
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+
+    sntp_setservername(0, "pool.ntp.org");
+
+    sntp_init();
+
+    ESP_LOGI(TAG, "List of configured NTP servers:");
+
+    for (uint8_t i = 0; i < SNTP_MAX_SERVERS; ++i){
+        if (sntp_getservername(i)){
+            ESP_LOGI(TAG, "server %d: %s", i, sntp_getservername(i));
+        } else {
+            // we have either IPv4 or IPv6 address, let's print it
+            char buff[48];
+            ip_addr_t const *ip = sntp_getserver(i);
+            if (ipaddr_ntoa_r(ip, buff, 48) != NULL)
+                ESP_LOGI(TAG, "server %d: %s", i, buff);
+        }
+    }
 }
